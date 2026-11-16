@@ -52,6 +52,10 @@ function promptNotebook() {
     lastSyncedAt: null,
     remoteUpdatedAt: null,
     showAuthPassword: false,
+    autoSync: true,
+    _localDirtyAt: null,
+    _pushTimer: null,
+    _autoSyncInProgress: false,
     _cryptoKey: null,
     _salt: null,
     _supabase: null,
@@ -76,7 +80,20 @@ function promptNotebook() {
     // ── Lifecycle ──────────────────────────────────────────
     async init() {
       this._loadTheme();
-      window.addEventListener('online', () => this.isOnline = true);
+      // Restore auto-sync preference (default true)
+      const savedAuto = localStorage.getItem('promptbook_auto_sync');
+      this.autoSync = savedAuto === null ? true : savedAuto === '1';
+      const savedLast = localStorage.getItem('promptbook_last_synced_at');
+      if (savedLast) {
+        const n = Number(savedLast);
+        if (!Number.isNaN(n)) this.lastSyncedAt = n;
+      }
+      window.addEventListener('online', () => {
+        this.isOnline = true;
+        if (this.autoSync && this.isLoggedIn && this.isUnlocked) {
+          this._scheduleAutoPush();
+        }
+      });
       window.addEventListener('offline', () => this.isOnline = false);
       window.addEventListener('storage', (e) => {
         // 僅在本分頁尚未鎖定時回應，避免 lock() setItem 造成跨 tab 無限 ping-pong
@@ -112,6 +129,13 @@ function promptNotebook() {
             if (event === 'SIGNED_OUT') {
               this.lastSyncedAt = null;
               this.remoteUpdatedAt = null;
+              this._localDirtyAt = null;
+            }
+            if ((event === 'SIGNED_IN' || event === 'INITIAL_SESSION') && session?.user) {
+              // Defer until unlock may complete; also try when already unlocked
+              setTimeout(() => {
+                if (this.autoSync && this.isUnlocked) this._maybeAutoPull({ quiet: true });
+              }, 400);
             }
           });
           // Restore session
@@ -237,6 +261,8 @@ function promptNotebook() {
         categories: this.categories,
       }, this._cryptoKey);
       localStorage.setItem('promptbook_vault', JSON.stringify(payload));
+      this._localDirtyAt = Date.now();
+      this._scheduleAutoPush();
     },
     async _loadVault() {
       const raw = localStorage.getItem('promptbook_vault');
@@ -344,6 +370,9 @@ function promptNotebook() {
         this.authPassword = '';
         this.showToast('已登入', 'success');
         await this._refreshRemoteMeta();
+        if (this.autoSync) {
+          await this._maybeAutoPull({ quiet: false });
+        }
       } catch (err) {
         console.error(err);
         this.authError = err?.message || '登入失敗，請檢查 Email / 密碼';
@@ -376,10 +405,11 @@ function promptNotebook() {
         this.authPassword = '';
         if (data.session) {
           this.showToast('註冊成功並已登入', 'success');
+          await this._refreshRemoteMeta();
+          if (this.autoSync) await this._maybeAutoPull({ quiet: false });
         } else {
           this.showToast('註冊成功，請檢查 Email 確認信（若已啟用）', 'success');
         }
-        await this._refreshRemoteMeta();
       } catch (err) {
         console.error(err);
         this.authError = err?.message || '註冊失敗';
@@ -401,30 +431,50 @@ function promptNotebook() {
       this.showToast('已登出', 'success');
     },
 
-    // ── Cloud Sync (E2EE: only encrypted vault) ────────────
+    // ── Cloud Sync (plaintext JSON under owner RLS) ────────
     _buildCloudPayload() {
-      const meta = this._readMeta();
-      const vaultRaw = localStorage.getItem('promptbook_vault');
-      if (!meta?.salt || !vaultRaw) return null;
-      let vault;
-      try {
-        vault = JSON.parse(vaultRaw);
-      } catch {
-        return null;
-      }
+      // 明文同步：與本機 export 格式一致（不上傳加密 vault）
+      if (!this.isUnlocked) return null;
       return {
         version: 1,
         app: APP_NAME,
-        meta: {
-          version: meta.version || 1,
-          salt: meta.salt,
-          iterations: meta.iterations || CRYPTO.PBKDF2_ITERATIONS,
-          createdAt: meta.createdAt || Date.now(),
-        },
-        vault,
-        // optional client hint
+        categories: [...this.categories],
+        items: this.prompts.map(({ _promptOpen, ...item }) => item),
         clientUpdatedAt: Date.now(),
       };
+    },
+
+    _applyCloudData(remote) {
+      if (!remote || typeof remote !== 'object') return false;
+      const items = Array.isArray(remote.items)
+        ? remote.items
+        : Array.isArray(remote)
+          ? remote
+          : null;
+      if (!items) return false;
+      const mapped = items
+        .map((p, i) =>
+          p && typeof p === 'object'
+            ? {
+                id: p.id ?? Date.now() + i + Math.random(),
+                title: String(p.title || p.name || ''),
+                category: String(p.category || ''),
+                prompt: String(p.prompt || p.content || p.text || ''),
+                notes: String(p.notes || ''),
+                tags: String(p.tags || ''),
+                favorite: Boolean(p.favorite),
+                createdAt: p.createdAt || Date.now(),
+                _promptOpen: false,
+              }
+            : null
+        )
+        .filter((p) => p?.title && p.prompt);
+      this.prompts = mapped;
+      this.categories = this._categoriesForItems(
+        Array.isArray(remote.categories) ? remote.categories : this.categories,
+        mapped
+      );
+      return true;
     },
 
     async _refreshRemoteMeta() {
@@ -457,7 +507,6 @@ function promptNotebook() {
         this.showToast('目前離線，無法同步', 'error');
         return;
       }
-      // Ensure vault is fresh
       try {
         await this._saveVault();
       } catch (e) {
@@ -466,7 +515,7 @@ function promptNotebook() {
       }
       const payload = this._buildCloudPayload();
       if (!payload) {
-        this.showToast('沒有可上傳的加密資料', 'error');
+        this.showToast('沒有可上傳的資料', 'error');
         return;
       }
       this.isSyncing = true;
@@ -484,8 +533,10 @@ function promptNotebook() {
           );
         if (error) throw error;
         this.lastSyncedAt = Date.now();
+        localStorage.setItem('promptbook_last_synced_at', String(this.lastSyncedAt));
+        this._localDirtyAt = null;
         await this._refreshRemoteMeta();
-        this.showToast('已上傳加密資料到雲端', 'success');
+        this.showToast('已上傳到雲端', 'success');
       } catch (err) {
         console.error(err);
         const msg = err?.message || '';
@@ -493,6 +544,8 @@ function promptNotebook() {
           this.showToast('上傳失敗：資料衝突，請改用「從雲端拉取」後再試', 'error');
         } else if (msg.includes('policy') || msg.includes('permission') || msg.includes('RLS')) {
           this.showToast('上傳失敗：權限不足，請確認 RLS 政策允許本人寫入', 'error');
+        } else if (msg.includes('app_data_app_check') || msg.includes('check constraint')) {
+          this.showToast('上傳失敗：app 欄位不在允許清單，請在 Supabase 把 promptbook 加入 check constraint', 'error');
         } else {
           this.showToast('上傳失敗：' + (msg || '未知錯誤'), 'error');
         }
@@ -510,6 +563,10 @@ function promptNotebook() {
         this.showToast('目前離線，無法同步', 'error');
         return;
       }
+      if (!this.isUnlocked) {
+        this.showToast('請先解鎖本機，再拉取雲端資料', 'error');
+        return;
+      }
       this.isSyncing = true;
       try {
         const { data: row, error } = await this._supabase
@@ -520,57 +577,156 @@ function promptNotebook() {
           .maybeSingle();
         if (error) throw error;
         if (!row?.data) {
-          this.showToast('雲端尚無此帳號的加密資料', 'error');
+          this.showToast('雲端尚無此帳號的資料', 'error');
           return;
         }
-        const remote = row.data;
-        if (!remote?.meta?.salt || !remote?.vault?.iv || !remote?.vault?.data) {
+        // 相容舊版「加密 vault」格式：提示用戶
+        if (row.data?.vault?.iv && row.data?.meta?.salt) {
+          this.showToast('雲端仍是舊的加密格式，請先在其他裝置用新版上傳一次', 'error');
+          return;
+        }
+        if (!this._applyCloudData(row.data)) {
           this.showToast('雲端資料格式不正確', 'error');
           return;
         }
-
-        // Write encrypted vault + meta to localStorage (still encrypted)
-        this._writeMeta({
-          version: remote.meta.version || 1,
-          salt: remote.meta.salt,
-          iterations: remote.meta.iterations || CRYPTO.PBKDF2_ITERATIONS,
-          createdAt: remote.meta.createdAt || Date.now(),
-        });
-        localStorage.setItem('promptbook_vault', JSON.stringify(remote.vault));
-
-        this.hasMasterPassword = true;
-        this.isFirstSetup = false;
+        await this._saveVault();
         this.remoteUpdatedAt = row.updated_at || null;
         this.lastSyncedAt = Date.now();
-
-        // If currently unlocked, try to re-load with existing key (same master password)
-        if (this.isUnlocked && this._cryptoKey) {
-          try {
-            this.prompts = await this._loadVault();
-            this.prompts = this.prompts.map((p, i) => ({
-              ...p,
-              id: p.id ?? (Date.now() + i),
-              _promptOpen: false,
-            }));
-            this.showToast('已從雲端拉取並解密更新', 'success');
-          } catch (decErr) {
-            // Different master password → force re-lock
-            this.lock();
-            this.showToast('已拉取雲端資料，請用正確主密碼重新解鎖', 'success');
-          }
-        } else {
-          // Locked state: just replace local encrypted data
-          this.isLocked = true;
-          this.isUnlocked = false;
-          this.prompts = [];
-          this._cryptoKey = null;
-          this.showToast('已從雲端拉取加密資料，請解鎖', 'success');
-        }
+        localStorage.setItem('promptbook_last_synced_at', String(this.lastSyncedAt));
+        this._localDirtyAt = null;
+        this.showToast('已從雲端拉取並更新', 'success');
       } catch (err) {
         console.error(err);
         this.showToast('拉取失敗：' + (err?.message || '未知錯誤'), 'error');
       } finally {
         this.isSyncing = false;
+      }
+    },
+
+    // ── Auto sync ──────────────────────────────────────────
+    toggleAutoSync() {
+      this.autoSync = !this.autoSync;
+      localStorage.setItem('promptbook_auto_sync', this.autoSync ? '1' : '0');
+      this.showToast(this.autoSync ? '已開啟自動同步' : '已關閉自動同步', 'success');
+      if (this.autoSync && this.isLoggedIn && this.isUnlocked) {
+        this._scheduleAutoPush();
+      }
+    },
+
+    _scheduleAutoPush() {
+      if (!this.autoSync || !this.isLoggedIn || !this.isUnlocked || !this.isOnline) return;
+      if (this._pushTimer) clearTimeout(this._pushTimer);
+      this._pushTimer = setTimeout(() => {
+        this._pushTimer = null;
+        this._autoPushQuiet().catch(() => {});
+      }, 2500);
+    },
+
+    async _autoPushQuiet() {
+      if (!this.autoSync || !this.isLoggedIn || !this.isUnlocked || !this.isOnline) return;
+      if (this.isSyncing || this._autoSyncInProgress) return;
+      if (!this._localDirtyAt) return;
+      // Skip if already synced after this dirty mark
+      if (this.lastSyncedAt && this._localDirtyAt <= this.lastSyncedAt) return;
+
+      this._autoSyncInProgress = true;
+      try {
+        const payload = this._buildCloudPayload();
+        if (!payload) return;
+        const { error } = await this._supabase
+          .from('app_data')
+          .upsert(
+            {
+              owner: this.authUser.id,
+              app: APP_NAME,
+              data: payload,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'owner,app' }
+          );
+        if (error) throw error;
+        this.lastSyncedAt = Date.now();
+        localStorage.setItem('promptbook_last_synced_at', String(this.lastSyncedAt));
+        this._localDirtyAt = null;
+        await this._refreshRemoteMeta();
+        this.showToast('已自動同步到雲端', 'success');
+      } catch (err) {
+        console.warn('[提示本本] 自動上傳失敗', err);
+        // Keep dirty flag so next schedule can retry
+      } finally {
+        this._autoSyncInProgress = false;
+      }
+    },
+
+    async _maybeAutoPull({ quiet = true } = {}) {
+      if (!this.autoSync || !this.isLoggedIn || !this._supabase || !this.isOnline) return;
+      if (!this.isUnlocked) return; // 明文同步需已解鎖才能套用
+      if (this.isSyncing || this._autoSyncInProgress) return;
+
+      this._autoSyncInProgress = true;
+      try {
+        const { data: row, error } = await this._supabase
+          .from('app_data')
+          .select('data, updated_at')
+          .eq('owner', this.authUser.id)
+          .eq('app', APP_NAME)
+          .maybeSingle();
+        if (error) throw error;
+
+        this.remoteUpdatedAt = row?.updated_at || null;
+
+        // No remote data yet → push local if unlocked
+        if (!row?.data) {
+          if (this.prompts.length || localStorage.getItem('promptbook_vault')) {
+            this._localDirtyAt = Date.now();
+            this._scheduleAutoPush();
+          }
+          return;
+        }
+
+        const remote = row.data;
+        // 跳過舊加密格式，避免覆蓋
+        if (remote?.vault?.iv && remote?.meta?.salt) {
+          if (!quiet) this.showToast('雲端仍是舊加密格式，請手動上傳一次以升級', 'info');
+          return;
+        }
+        if (!Array.isArray(remote.items) && !Array.isArray(remote)) return;
+
+        const remoteMs = row.updated_at ? new Date(row.updated_at).getTime() : 0;
+        const last = this.lastSyncedAt || 0;
+        const localDirty = !!(this._localDirtyAt && this._localDirtyAt > last);
+        const hasLocal = this.prompts.length > 0 || !!localStorage.getItem('promptbook_vault');
+
+        // Already up to date
+        if (hasLocal && remoteMs && remoteMs <= last && !localDirty) return;
+
+        // Conflict: local has unsynced changes AND remote is newer
+        if (hasLocal && localDirty && remoteMs > last) {
+          const ok = confirm(
+            '雲端有較新的資料，本機也有未同步變更。\n\n按「確定」用雲端覆蓋本機；按「取消」保留本機（稍後可手動上傳）。'
+          );
+          if (!ok) return;
+        } else if (hasLocal && remoteMs <= last && localDirty) {
+          // Local is ahead → push instead
+          this._scheduleAutoPush();
+          return;
+        }
+
+        if (!this._applyCloudData(remote)) return;
+        await this._saveVault();
+        // _saveVault 會標記 dirty 並排程 push，這裡清掉避免立刻回傳同一份
+        this._localDirtyAt = null;
+        if (this._pushTimer) {
+          clearTimeout(this._pushTimer);
+          this._pushTimer = null;
+        }
+        this.lastSyncedAt = Date.now();
+        localStorage.setItem('promptbook_last_synced_at', String(this.lastSyncedAt));
+        if (!quiet) this.showToast('已自動從雲端同步', 'success');
+      } catch (err) {
+        console.warn('[提示本本] 自動拉取失敗', err);
+      } finally {
+        this._autoSyncInProgress = false;
       }
     },
 
@@ -616,6 +772,9 @@ function promptNotebook() {
         this.masterPasswordInput = '';
         this.confirmPasswordInput = '';
         this.showToast('主密碼已設定，資料已加密保護', 'success');
+        if (this.autoSync && this.isLoggedIn) {
+          this._scheduleAutoPush();
+        }
       } catch (err) {
         console.error(err);
         this.unlockError = '設定失敗，請再試一次';
@@ -649,6 +808,9 @@ function promptNotebook() {
         this.isUnlocked = true;
         this.masterPasswordInput = '';
         this.showToast('已解鎖', 'success');
+        if (this.autoSync && this.isLoggedIn) {
+          this._maybeAutoPull({ quiet: true }).catch(() => {});
+        }
       } catch (err) {
         console.error(err);
         this._cryptoKey = null;
