@@ -1,6 +1,6 @@
 /**
  * 提示本本 – Secure local AI prompt notebook
- * AES-GCM + PBKDF2 (120k iterations) · Offline-first
+ * AES-GCM + PBKDF2 (120k iterations) · Offline-first · Supabase Auth + E2EE sync
  */
 const CRYPTO = {
   PBKDF2_ITERATIONS: 120_000,
@@ -9,6 +9,10 @@ const CRYPTO = {
   KEY_BITS: 256,
 };
 const DEFAULT_CATEGORIES = ['寫程式', 'Database', '角色人設', 'UI 規格', '其他'];
+
+const SUPABASE_URL = 'https://wanknivxcsrasdkkxmfr.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndhbmtuaXZ4Y3NyYXNka2t4bWZyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODczMzE4NjcsImV4cCI6MjEwMjkwNzg2N30.tqsFimERtYCxoh8J-8FlqxByWtX2gNnyaGo08jditrs';
+const APP_NAME = 'promptbook';
 
 function promptNotebook() {
   return {
@@ -37,10 +41,20 @@ function promptNotebook() {
     importDialogOpen: false,
     importPreview: [],
     importPreviewCategories: [],
-    // Cloud sync requires verified identity; email-only sync stays disabled.
+    // Cloud sync / Auth
     syncDialogOpen: false,
+    authEmail: '',
+    authPassword: '',
+    authError: '',
+    authUser: null,
+    authLoading: false,
+    isSyncing: false,
+    lastSyncedAt: null,
+    remoteUpdatedAt: null,
+    showAuthPassword: false,
     _cryptoKey: null,
     _salt: null,
+    _supabase: null,
 
     // ── Computed ───────────────────────────────────────────
     get filteredPrompts() {
@@ -53,6 +67,10 @@ function promptNotebook() {
         (p.prompt || '').toLowerCase().includes(q) ||
         (p.notes || '').toLowerCase().includes(q)
       );
+    },
+
+    get isLoggedIn() {
+      return !!(this.authUser && this.authUser.id);
     },
 
     // ── Lifecycle ──────────────────────────────────────────
@@ -72,9 +90,40 @@ function promptNotebook() {
           // Soft lock on background is optional; full lock on unload
         }
       });
+      this._initSupabase();
       await this._bootstrap();
       localStorage.removeItem('promptbook_supabase_session');
       localStorage.removeItem('promptbook_pkce_verifier');
+    },
+
+    _initSupabase() {
+      try {
+        if (typeof supabase !== 'undefined' && supabase.createClient) {
+          this._supabase = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+            auth: {
+              persistSession: true,
+              autoRefreshToken: true,
+              detectSessionInUrl: true,
+              storageKey: 'promptbook_sb_auth',
+            },
+          });
+          this._supabase.auth.onAuthStateChange((event, session) => {
+            this.authUser = session?.user ?? null;
+            if (event === 'SIGNED_OUT') {
+              this.lastSyncedAt = null;
+              this.remoteUpdatedAt = null;
+            }
+          });
+          // Restore session
+          this._supabase.auth.getSession().then(({ data }) => {
+            this.authUser = data?.session?.user ?? null;
+          }).catch(() => {});
+        } else {
+          console.warn('[提示本本] supabase-js 未載入，雲端同步不可用');
+        }
+      } catch (e) {
+        console.error('[提示本本] Supabase 初始化失敗', e);
+      }
     },
 
     async _bootstrap() {
@@ -267,8 +316,265 @@ function promptNotebook() {
     },
 
     openSyncDialog() {
+      this.authError = '';
       this.syncDialogOpen = true;
+      if (this.isLoggedIn) {
+        this._refreshRemoteMeta().catch(() => {});
+      }
     },
+
+    // ── Supabase Auth ──────────────────────────────────────
+    async signInWithEmail() {
+      this.authError = '';
+      const email = (this.authEmail || '').trim();
+      const password = this.authPassword || '';
+      if (!email || !password) {
+        this.authError = '請輸入 Email 與密碼';
+        return;
+      }
+      if (!this._supabase) {
+        this.authError = 'Supabase 尚未載入，請重新整理頁面';
+        return;
+      }
+      this.authLoading = true;
+      try {
+        const { data, error } = await this._supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+        this.authUser = data.user;
+        this.authPassword = '';
+        this.showToast('已登入', 'success');
+        await this._refreshRemoteMeta();
+      } catch (err) {
+        console.error(err);
+        this.authError = err?.message || '登入失敗，請檢查 Email / 密碼';
+      } finally {
+        this.authLoading = false;
+      }
+    },
+
+    async signUpWithEmail() {
+      this.authError = '';
+      const email = (this.authEmail || '').trim();
+      const password = this.authPassword || '';
+      if (!email || !password) {
+        this.authError = '請輸入 Email 與密碼';
+        return;
+      }
+      if (password.length < 6) {
+        this.authError = '密碼至少 6 個字元';
+        return;
+      }
+      if (!this._supabase) {
+        this.authError = 'Supabase 尚未載入，請重新整理頁面';
+        return;
+      }
+      this.authLoading = true;
+      try {
+        const { data, error } = await this._supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        this.authUser = data.user;
+        this.authPassword = '';
+        if (data.session) {
+          this.showToast('註冊成功並已登入', 'success');
+        } else {
+          this.showToast('註冊成功，請檢查 Email 確認信（若已啟用）', 'success');
+        }
+        await this._refreshRemoteMeta();
+      } catch (err) {
+        console.error(err);
+        this.authError = err?.message || '註冊失敗';
+      } finally {
+        this.authLoading = false;
+      }
+    },
+
+    async signOut() {
+      if (!this._supabase) return;
+      try {
+        await this._supabase.auth.signOut();
+      } catch (e) {
+        console.error(e);
+      }
+      this.authUser = null;
+      this.lastSyncedAt = null;
+      this.remoteUpdatedAt = null;
+      this.showToast('已登出', 'success');
+    },
+
+    // ── Cloud Sync (E2EE: only encrypted vault) ────────────
+    _buildCloudPayload() {
+      const meta = this._readMeta();
+      const vaultRaw = localStorage.getItem('promptbook_vault');
+      if (!meta?.salt || !vaultRaw) return null;
+      let vault;
+      try {
+        vault = JSON.parse(vaultRaw);
+      } catch {
+        return null;
+      }
+      return {
+        version: 1,
+        app: APP_NAME,
+        meta: {
+          version: meta.version || 1,
+          salt: meta.salt,
+          iterations: meta.iterations || CRYPTO.PBKDF2_ITERATIONS,
+          createdAt: meta.createdAt || Date.now(),
+        },
+        vault,
+        // optional client hint
+        clientUpdatedAt: Date.now(),
+      };
+    },
+
+    async _refreshRemoteMeta() {
+      if (!this._supabase || !this.isLoggedIn) return;
+      try {
+        const { data, error } = await this._supabase
+          .from('app_data')
+          .select('updated_at')
+          .eq('owner', this.authUser.id)
+          .eq('app', APP_NAME)
+          .maybeSingle();
+        if (error) throw error;
+        this.remoteUpdatedAt = data?.updated_at || null;
+      } catch (e) {
+        console.warn('[提示本本] 讀取遠端時間失敗', e);
+        this.remoteUpdatedAt = null;
+      }
+    },
+
+    async pushToCloud() {
+      if (!this.isUnlocked) {
+        this.showToast('請先解鎖本機資料', 'error');
+        return;
+      }
+      if (!this.isLoggedIn || !this._supabase) {
+        this.showToast('請先登入雲端帳號', 'error');
+        return;
+      }
+      if (!this.isOnline) {
+        this.showToast('目前離線，無法同步', 'error');
+        return;
+      }
+      // Ensure vault is fresh
+      try {
+        await this._saveVault();
+      } catch (e) {
+        this.showToast('本機儲存失敗，無法上傳', 'error');
+        return;
+      }
+      const payload = this._buildCloudPayload();
+      if (!payload) {
+        this.showToast('沒有可上傳的加密資料', 'error');
+        return;
+      }
+      this.isSyncing = true;
+      try {
+        const { error } = await this._supabase
+          .from('app_data')
+          .upsert(
+            {
+              owner: this.authUser.id,
+              app: APP_NAME,
+              data: payload,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'owner,app' }
+          );
+        if (error) throw error;
+        this.lastSyncedAt = Date.now();
+        await this._refreshRemoteMeta();
+        this.showToast('已上傳加密資料到雲端', 'success');
+      } catch (err) {
+        console.error(err);
+        const msg = err?.message || '';
+        if (msg.includes('duplicate') || msg.includes('unique')) {
+          this.showToast('上傳失敗：資料衝突，請改用「從雲端拉取」後再試', 'error');
+        } else if (msg.includes('policy') || msg.includes('permission') || msg.includes('RLS')) {
+          this.showToast('上傳失敗：權限不足，請確認 RLS 政策允許本人寫入', 'error');
+        } else {
+          this.showToast('上傳失敗：' + (msg || '未知錯誤'), 'error');
+        }
+      } finally {
+        this.isSyncing = false;
+      }
+    },
+
+    async pullFromCloud() {
+      if (!this.isLoggedIn || !this._supabase) {
+        this.showToast('請先登入雲端帳號', 'error');
+        return;
+      }
+      if (!this.isOnline) {
+        this.showToast('目前離線，無法同步', 'error');
+        return;
+      }
+      this.isSyncing = true;
+      try {
+        const { data: row, error } = await this._supabase
+          .from('app_data')
+          .select('data, updated_at')
+          .eq('owner', this.authUser.id)
+          .eq('app', APP_NAME)
+          .maybeSingle();
+        if (error) throw error;
+        if (!row?.data) {
+          this.showToast('雲端尚無此帳號的加密資料', 'error');
+          return;
+        }
+        const remote = row.data;
+        if (!remote?.meta?.salt || !remote?.vault?.iv || !remote?.vault?.data) {
+          this.showToast('雲端資料格式不正確', 'error');
+          return;
+        }
+
+        // Write encrypted vault + meta to localStorage (still encrypted)
+        this._writeMeta({
+          version: remote.meta.version || 1,
+          salt: remote.meta.salt,
+          iterations: remote.meta.iterations || CRYPTO.PBKDF2_ITERATIONS,
+          createdAt: remote.meta.createdAt || Date.now(),
+        });
+        localStorage.setItem('promptbook_vault', JSON.stringify(remote.vault));
+
+        this.hasMasterPassword = true;
+        this.isFirstSetup = false;
+        this.remoteUpdatedAt = row.updated_at || null;
+        this.lastSyncedAt = Date.now();
+
+        // If currently unlocked, try to re-load with existing key (same master password)
+        if (this.isUnlocked && this._cryptoKey) {
+          try {
+            this.prompts = await this._loadVault();
+            this.prompts = this.prompts.map((p, i) => ({
+              ...p,
+              id: p.id ?? (Date.now() + i),
+              _promptOpen: false,
+            }));
+            this.showToast('已從雲端拉取並解密更新', 'success');
+          } catch (decErr) {
+            // Different master password → force re-lock
+            this.lock();
+            this.showToast('已拉取雲端資料，請用正確主密碼重新解鎖', 'success');
+          }
+        } else {
+          // Locked state: just replace local encrypted data
+          this.isLocked = true;
+          this.isUnlocked = false;
+          this.prompts = [];
+          this._cryptoKey = null;
+          this.showToast('已從雲端拉取加密資料，請解鎖', 'success');
+        }
+      } catch (err) {
+        console.error(err);
+        this.showToast('拉取失敗：' + (err?.message || '未知錯誤'), 'error');
+      } finally {
+        this.isSyncing = false;
+      }
+    },
+
+    // ── Export helpers ─────────────────────────────────────
     _exportData() {
       return {
         app: 'promptbook',
@@ -570,6 +876,16 @@ function promptNotebook() {
         this.toasts = this.toasts.filter(t => t.id !== id);
       }, 2800);
     },
+
+    formatTime(ts) {
+      if (!ts) return '—';
+      try {
+        const d = typeof ts === 'number' ? new Date(ts) : new Date(ts);
+        if (Number.isNaN(d.getTime())) return '—';
+        return d.toLocaleString('zh-HK', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      } catch {
+        return '—';
+      }
+    },
   };
 }
-
